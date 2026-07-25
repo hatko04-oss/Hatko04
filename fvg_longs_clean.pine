@@ -11,13 +11,15 @@
 // Magnets vanish once price trades through them; fixed R fallback if none.
 strategy("FVG Longs Clean", overlay = true, initial_capital = 10000, pyramiding = 20, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
 
-minGapAtr = input.float(0.3, "Min gap size (x ATR)", step = 0.05)
-maxGapAtr = input.float(1.0, "Max gap size (x ATR)", step = 0.1)
+minGapAtr = input.float(0.2, "Min gap size (x ATR)", step = 0.05)
+maxGapAtr = input.float(1.5, "Max gap size (x ATR)", step = 0.1)
 stopBufTicks = input.int(3, "Stop buffer below zone (ticks)", minval = 0)
+minStopAtr = input.float(0.3, "Min stop distance (x ATR)", step = 0.05)
 riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1)
 tgtSwing = input.int(5, "Clean-high swing length", minval = 2)
 rrFallback = input.float(4.0, "Fallback R:R (no magnet above)", step = 0.5)
-emaLen = input.int(100, "Only long above EMA (length)", minval = 10)
+useEma = input.bool(false, "Only long above trend EMA", inline = "e")
+emaLen = input.int(100, "length", minval = 10, inline = "e")
 maxOpen = input.int(5, "Max stacked trades", minval = 1, maxval = 20)
 maxDD = input.float(20.0, "Halt when account down (%)", step = 5)
 
@@ -103,8 +105,11 @@ if low > high[2] and gapSz >= minGapAtr * atr and gapSz <= maxGapAtr * atr
 
 //  Entry: one market buy per bar on the freshest retrace
 var int n = 0
-if not na(hitBot) and close > ema and not halted and strategy.opentrades < maxOpen
-    stopPx = hitBot - stopBufTicks * syminfo.mintick
+if not na(hitBot) and (not useEma or close > ema) and not halted and strategy.opentrades < maxOpen
+    // Stop below the zone, but never closer than minStopAtr - a too-tight
+    // stop makes position size explode and slippage eat far more than the
+    // intended risk (this is what drained equity into the halt before).
+    stopPx = math.min(hitBot - stopBufTicks * syminfo.mintick, close - minStopAtr * atr)
     dist = close - stopPx
     float tp = f_nearestAbove(cleanHighs, close, na)
     tp := f_nearestAbove(gapMids, close, tp)
