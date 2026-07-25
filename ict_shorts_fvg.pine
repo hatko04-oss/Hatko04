@@ -1,0 +1,289 @@
+//@version=6
+// ICT shorts-only FVG bot - validation build for TradingView (Pine v6).
+// Chart: XAUUSD, 1-minute. Zones from M5/M15 bearish displacement FVGs.
+// Sell on first touch of gap's lower edge. Bias: M15 bearish structure
+// + price below NWOG midpoint. Stop above gap + ATR buffer (zone TF's ATR).
+// Target: first clean (unswept) low below entry, fallback fixed R:R.
+//
+// HTF data uses the confirmed-bar pattern (expr[1] + lookahead_on): only
+// fully closed M5/M15 bars produce zones and pivots, so realtime behavior
+// matches the backtest (no repainting from developing HTF bars).
+//
+// Costs: slippage = 10 ticks (~$0.10) approximates gold spread. Set
+// commission to match your broker in Properties, and enable bar magnifier
+// there if your plan has it - plain 1-min OHLC fills are optimistic for
+// limit+stop pairs.
+
+strategy("ICT Shorts FVG v6", overlay = true, initial_capital = 10000, currency = currency.USD, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100, max_labels_count = 200, max_lines_count = 100)
+
+//  Inputs
+grpZ = "FVG zones"
+useM1z = input.bool(false, "Use chart-TF (M1) FVGs", group = grpZ)
+useM5z = input.bool(true, "Use M5 FVGs", group = grpZ)
+useM15z = input.bool(true, "Use M15 FVGs", group = grpZ)
+dispMul = input.float(0.5, "Displacement body (x ATR)", step = 0.1, group = grpZ)
+minGapUsd = input.float(0.50, "Min gap height ($)", step = 0.10, group = grpZ)
+maxZones = input.int(20, "Max tracked zones", minval = 4, group = grpZ)
+
+grpB = "Bias"
+useNwogBias = input.bool(true, "Require price below NWOG midpoint", group = grpB)
+biasSwing = input.int(5, "M15 swing length", minval = 2, group = grpB)
+
+grpR = "Risk / exits"
+stopBufMul = input.float(0.25, "Stop buffer above gap (x ATR)", step = 0.05, group = grpR)
+tgtSwing = input.int(5, "Clean-low swing length", minval = 2, group = grpR)
+minRR = input.float(1.0, "Min R:R for clean-low target", step = 0.25, group = grpR)
+rrFallback = input.float(2.0, "Fallback R:R (no clean low)", step = 0.25, group = grpR)
+riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1, group = grpR)
+maxDayLoss = input.float(2.0, "Max daily loss halt (%)", step = 0.25, group = grpR)
+orderTTL = input.int(30, "Pending order valid (bars)", minval = 1, group = grpR)
+
+grpS = "Sessions"
+useKZ = input.bool(true, "Trade only in killzones", group = grpS)
+londonKZ = input.session("0800-1100", "London killzone", group = grpS)
+lonTZ = input.string("Europe/London", "London killzone timezone", group = grpS)
+nyKZ = input.session("0830-1100", "New York killzone", group = grpS)
+nyTZ = input.string("America/New_York", "New York killzone timezone", group = grpS)
+
+atr = ta.atr(14)
+// Session strings are evaluated in the exchange timezone by default, which
+// is almost never London/NY for gold feeds - pass the timezone explicitly.
+inKZ = not useKZ or not na(time(timeframe.period, londonKZ, lonTZ)) or not na(time(timeframe.period, nyKZ, nyTZ))
+
+//  Bearish displacement FVG detector
+// Gap = candle3.high .. candle1.low, middle candle is the displacement leg.
+f_bearFVG() =>
+    a = ta.atr(14)
+    disp = math.abs(close[1] - open[1]) > dispMul * a
+    sig = high < low[2] and disp and low[2] - high >= minGapUsd
+    [sig, low[2], high, a]
+
+// Confirmed-bar wrapper: with lookahead_on this returns the last *closed*
+// HTF bar's values, historical and realtime alike. The HTF bar time rides
+// along as a dedupe key.
+f_bearFVGconf() =>
+    [sig, top, bot, a] = f_bearFVG()
+    [sig[1], top[1], bot[1], a[1], time[1]]
+
+[s1, t1, b1, a1] = f_bearFVG()
+[s5, t5, b5, a5, tm5] = request.security(syminfo.tickerid, "5", f_bearFVGconf(), barmerge.gaps_off, barmerge.lookahead_on)
+[s15, t15, b15, a15, tm15] = request.security(syminfo.tickerid, "15", f_bearFVGconf(), barmerge.gaps_off, barmerge.lookahead_on)
+
+//  Zone store
+// Parallel arrays: top, bottom, source-TF ATR (for the stop buffer),
+// creation bar (so the creating candle doesn't count as a touch), box.
+var array<float> zTop = array.new_float()
+var array<float> zBot = array.new_float()
+var array<float> zAtr = array.new_float()
+var array<int> zBar = array.new_int()
+var array<box> zBox = array.new<box>()
+
+f_removeZone(int i) =>
+    box.delete(array.get(zBox, i))
+    array.remove(zTop, i)
+    array.remove(zBot, i)
+    array.remove(zAtr, i)
+    array.remove(zBar, i)
+    array.remove(zBox, i)
+
+f_addZone(float top, float bot, float srcAtr) =>
+    array.unshift(zTop, top)
+    array.unshift(zBot, bot)
+    array.unshift(zAtr, srcAtr)
+    array.unshift(zBar, bar_index)
+    array.unshift(zBox, box.new(bar_index, top, bar_index + 60, bot, bgcolor = color.new(color.maroon, 88), border_color = color.new(color.maroon, 60)))
+    if array.size(zTop) > maxZones
+        f_removeZone(array.size(zTop) - 1)
+
+f_findZone(float top, float bot) =>
+    int idx = -1
+    if array.size(zTop) > 0
+        for i = 0 to array.size(zTop) - 1
+            if array.get(zTop, i) == top and array.get(zBot, i) == bot
+                idx := i
+                break
+    idx
+
+// Dedupe HTF signals by their HTF bar time (top/bot equality would both
+// re-add a forming zone and silently drop a genuinely new identical one).
+var int last5t = na
+var int last15t = na
+if useM1z and s1 and barstate.isconfirmed
+    f_addZone(t1, b1, a1)
+if useM5z and s5 and (na(last5t) or tm5 != last5t)
+    f_addZone(t5, b5, a5)
+    last5t := tm5
+if useM15z and s15 and (na(last15t) or tm15 != last15t)
+    f_addZone(t15, b15, a15)
+    last15t := tm15
+
+// Consume zones on first touch of the lower edge (whether or not we had an
+// order working - a missed touch is missed for good), and invalidate zones
+// price has closed above.
+if array.size(zTop) > 0
+    for i = array.size(zTop) - 1 to 0
+        touched = bar_index > array.get(zBar, i) and high >= array.get(zBot, i)
+        invalid = close > array.get(zTop, i)
+        if touched or invalid
+            f_removeZone(i)
+
+//  NWOG / NDOG (last 5 each; NDOG is drawn for reference only)
+var array<float> nwogT = array.new_float()
+var array<float> nwogB = array.new_float()
+var array<float> ndogT = array.new_float()
+var array<float> ndogB = array.new_float()
+
+f_addGap(array<float> arrT, array<float> arrB, float a, float b, color col) =>
+    array.unshift(arrT, math.max(a, b))
+    array.unshift(arrB, math.min(a, b))
+    if array.size(arrT) > 5
+        array.pop(arrT)
+        array.pop(arrB)
+    box.new(bar_index, math.max(a, b), bar_index + 300, math.min(a, b), bgcolor = color.new(col, 92), border_color = color.new(col, 55))
+
+newWeek = timeframe.change("W")
+newDay = timeframe.change("D")
+if newWeek and not na(close[1])
+    f_addGap(nwogT, nwogB, open, close[1], color.purple)
+if newDay and not newWeek and not na(close[1])
+    f_addGap(ndogT, ndogB, open, close[1], color.gray)
+
+nwogMid = array.size(nwogT) > 0 ? (array.get(nwogT, 0) + array.get(nwogB, 0)) / 2 : na
+plot(nwogMid, "NWOG mid", color = color.new(color.purple, 30), style = plot.style_linebr)
+
+//  Bias: M15 structure bearish (+ optional NWOG filter)
+// Pivot values are latched inside the HTF context and returned one bar
+// delayed (confirmed), with the confirmation bar's time as a dedupe key -
+// a pivot that flashes on a developing M15 bar can never be latched here.
+f_m15Pivots() =>
+    ph = ta.pivothigh(high, biasSwing, biasSwing)
+    pl = ta.pivotlow(low, biasSwing, biasSwing)
+    var float lastPH = na
+    var int phT = na
+    var float lastPL = na
+    var int plT = na
+    if not na(ph)
+        lastPH := ph
+        phT := time
+    if not na(pl)
+        lastPL := pl
+        plT := time
+    [lastPH[1], phT[1], lastPL[1], plT[1]]
+
+[hPH, hPHt, hPL, hPLt] = request.security(syminfo.tickerid, "15", f_m15Pivots(), barmerge.gaps_off, barmerge.lookahead_on)
+var float lPH = na
+var float pPH = na
+var float lPL = na
+var float pPL = na
+var int seenPHt = na
+var int seenPLt = na
+if not na(hPHt) and (na(seenPHt) or hPHt != seenPHt)
+    pPH := lPH
+    lPH := hPH
+    seenPHt := hPHt
+if not na(hPLt) and (na(seenPLt) or hPLt != seenPLt)
+    pPL := lPL
+    lPL := hPL
+    seenPLt := hPLt
+structBear = not na(pPH) and not na(pPL) and lPH < pPH and lPL < pPL
+nwogOK = not useNwogBias or na(nwogMid) or close < nwogMid
+biasBear = structBear and nwogOK
+plotchar(biasBear, "Bias bear", "▼", location.bottom, color.maroon, size = size.tiny)
+
+//  Clean lows (unswept liquidity) for targets
+var array<float> cleanLows = array.new_float()
+pl = ta.pivotlow(low, tgtSwing, tgtSwing)
+if not na(pl)
+    array.unshift(cleanLows, pl)
+    if array.size(cleanLows) > 50
+        array.pop(cleanLows)
+if array.size(cleanLows) > 0
+    for i = array.size(cleanLows) - 1 to 0
+        if low < array.get(cleanLows, i)
+            array.remove(cleanLows, i)
+
+f_firstCleanLowBelow(float p) =>
+    float best = na
+    if array.size(cleanLows) > 0
+        for i = 0 to array.size(cleanLows) - 1
+            v = array.get(cleanLows, i)
+            if v < p and (na(best) or v > best)
+                best := v
+    best
+
+//  Risk state
+var float dayStartEq = na
+if newDay or na(dayStartEq)
+    dayStartEq := strategy.equity
+dailyHalted = strategy.equity <= dayStartEq * (1 - maxDayLoss / 100)
+
+//  Pending order lifecycle
+// pendTop/pendBot identify the zone the working order belongs to.
+var int pendingSince = na
+var float pendTop = na
+var float pendBot = na
+var int lastClosed = 0
+flat = strategy.position_size == 0
+
+// Order filled: position visible, or it opened and closed within one bar.
+if not na(pendingSince) and (not flat or strategy.closedtrades > lastClosed)
+    pendingSince := na
+    pendTop := na
+    pendBot := na
+lastClosed := strategy.closedtrades
+
+// Stale: zone untouched for orderTTL bars - cancel and retire the zone too,
+// otherwise the same order would just be re-placed next bar.
+if not na(pendingSince) and flat and bar_index - pendingSince > orderTTL
+    strategy.cancel("S")
+    ttlIdx = f_findZone(pendTop, pendBot)
+    if ttlIdx >= 0
+        f_removeZone(ttlIdx)
+    pendingSince := na
+    pendTop := na
+    pendBot := na
+
+// Zone gone (price closed above it without touching the edge, e.g. a gap
+// through the zone): the setup no longer exists, pull the order.
+if not na(pendingSince) and flat and f_findZone(pendTop, pendBot) == -1
+    strategy.cancel("S")
+    pendingSince := na
+    pendTop := na
+    pendBot := na
+
+// Daily halt: don't leave a resting order that could fill after the halt.
+if not na(pendingSince) and flat and dailyHalted
+    strategy.cancel("S")
+    pendingSince := na
+    pendTop := na
+    pendBot := na
+
+canTrade = flat and na(pendingSince) and not dailyHalted and inKZ and biasBear
+
+//  Entry: sell limit at lower edge of nearest zone above price
+if canTrade and array.size(zBot) > 0
+    int zi = -1
+    float nearBot = na
+    for i = 0 to array.size(zBot) - 1
+        b = array.get(zBot, i)
+        if b > close and (na(nearBot) or b < nearBot)
+            nearBot := b
+            zi := i
+    if zi >= 0
+        top = array.get(zTop, zi)
+        entryPx = nearBot
+        stopPx = top + stopBufMul * array.get(zAtr, zi)
+        dist = stopPx - entryPx
+        tCl = f_firstCleanLowBelow(entryPx - dist * minRR)
+        tgt = na(tCl) ? entryPx - rrFallback * dist : tCl
+        if dist > 0 and tgt < entryPx
+            qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+            if qty > 0
+                strategy.entry("S", strategy.short, qty = qty, limit = entryPx)
+                strategy.exit("Sx", "S", stop = stopPx, limit = tgt)
+                pendingSince := bar_index
+                pendTop := top
+                pendBot := nearBot
+
+bgcolor(useKZ and inKZ ? color.new(color.blue, 96) : na)
+plotchar(dailyHalted, "Daily halt", "X", location.top, color.orange, size = size.tiny)
