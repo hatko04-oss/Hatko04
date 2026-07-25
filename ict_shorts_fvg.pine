@@ -26,6 +26,7 @@ minGapUsd = input.float(0.50, "Min gap height ($)", step = 0.10, group = grpZ)
 maxZones = input.int(20, "Max tracked zones", minval = 4, group = grpZ)
 
 grpB = "Bias"
+useStructBias = input.bool(true, "Require M15 bearish structure", group = grpB)
 useNwogBias = input.bool(true, "Require price below NWOG midpoint", group = grpB)
 biasSwing = input.int(5, "M15 swing length", minval = 2, group = grpB)
 
@@ -45,10 +46,23 @@ lonTZ = input.string("Europe/London", "London killzone timezone", group = grpS)
 nyKZ = input.session("0830-1100", "New York killzone", group = grpS)
 nyTZ = input.string("America/New_York", "New York killzone timezone", group = grpS)
 
+grpD = "Diagnostics"
+showDebug = input.bool(true, "Show diagnostics table", group = grpD)
+
 atr = ta.atr(14)
 // Session strings are evaluated in the exchange timezone by default, which
 // is almost never London/NY for gold feeds - pass the timezone explicitly.
 inKZ = not useKZ or not na(time(timeframe.period, londonKZ, lonTZ)) or not na(time(timeframe.period, nyKZ, nyTZ))
+
+// Funnel counters for the diagnostics table.
+var int cntBars = 0
+var int cntZones = 0
+var int cntTouch = 0
+var int cntInval = 0
+var int cntOrders = 0
+var int cntTTL = 0
+var int cntBias = 0
+var int cntKZ = 0
 
 //  Bearish displacement FVG detector
 // Gap = candle3.high .. candle1.low, middle candle is the displacement leg.
@@ -110,12 +124,15 @@ var int last5t = na
 var int last15t = na
 if useM1z and s1 and barstate.isconfirmed
     f_addZone(t1, b1, a1)
+    cntZones += 1
 if useM5z and s5 and (na(last5t) or tm5 != last5t)
     f_addZone(t5, b5, a5)
     last5t := tm5
+    cntZones += 1
 if useM15z and s15 and (na(last15t) or tm15 != last15t)
     f_addZone(t15, b15, a15)
     last15t := tm15
+    cntZones += 1
 
 // Consume zones on first touch of the lower edge (whether or not we had an
 // order working - a missed touch is missed for good), and invalidate zones
@@ -125,6 +142,10 @@ if array.size(zTop) > 0
         touched = bar_index > array.get(zBar, i) and high >= array.get(zBot, i)
         invalid = close > array.get(zTop, i)
         if touched or invalid
+            if touched
+                cntTouch += 1
+            else
+                cntInval += 1
             f_removeZone(i)
 
 //  NWOG / NDOG (last 5 each; NDOG is drawn for reference only)
@@ -186,8 +207,9 @@ if not na(hPLt) and (na(seenPLt) or hPLt != seenPLt)
     lPL := hPL
     seenPLt := hPLt
 structBear = not na(pPH) and not na(pPL) and lPH < pPH and lPL < pPL
+structOK = not useStructBias or structBear
 nwogOK = not useNwogBias or na(nwogMid) or close < nwogMid
-biasBear = structBear and nwogOK
+biasBear = structOK and nwogOK
 plotchar(biasBear, "Bias bear", "▼", location.bottom, color.maroon, size = size.tiny)
 
 //  Clean lows (unswept liquidity) for targets
@@ -239,6 +261,7 @@ if not na(pendingSince) and flat and bar_index - pendingSince > orderTTL
     ttlIdx = f_findZone(pendTop, pendBot)
     if ttlIdx >= 0
         f_removeZone(ttlIdx)
+    cntTTL += 1
     pendingSince := na
     pendTop := na
     pendBot := na
@@ -284,6 +307,32 @@ if canTrade and array.size(zBot) > 0
                 pendingSince := bar_index
                 pendTop := top
                 pendBot := nearBot
+                cntOrders += 1
 
 bgcolor(useKZ and inKZ ? color.new(color.blue, 96) : na)
 plotchar(dailyHalted, "Daily halt", "X", location.top, color.orange, size = size.tiny)
+
+//  Diagnostics: where do setups die?
+cntBars += 1
+if biasBear
+    cntBias += 1
+if inKZ
+    cntKZ += 1
+
+var table diag = showDebug ? table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 80), border_width = 1, border_color = color.new(color.gray, 70)) : na
+
+f_row(int r, string k, string v) =>
+    table.cell(diag, 0, r, k, text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(diag, 1, r, v, text_color = color.white, text_halign = text.align_right, text_size = size.small)
+
+if showDebug and barstate.islast
+    f_row(0, "Bars loaded", str.tostring(cntBars))
+    f_row(1, "Zones created", str.tostring(cntZones))
+    f_row(2, "Consumed by touch", str.tostring(cntTouch))
+    f_row(3, "Invalidated", str.tostring(cntInval))
+    f_row(4, "Active zones now", str.tostring(array.size(zTop)))
+    f_row(5, "Orders placed", str.tostring(cntOrders))
+    f_row(6, "TTL cancels", str.tostring(cntTTL))
+    f_row(7, "Trades", str.tostring(strategy.closedtrades + strategy.opentrades))
+    f_row(8, "Bias-bear bars", str.tostring(100.0 * cntBias / math.max(cntBars, 1), "#.#") + "%")
+    f_row(9, "Killzone bars", str.tostring(100.0 * cntKZ / math.max(cntBars, 1), "#.#") + "%")
