@@ -1,0 +1,169 @@
+//@version=6
+// ICT Session FVG Longs - 1-MINUTE CHART ONLY.
+// Longs only. In each of the three sessions (Asian 20:00-00:00, London
+// 02:00-05:00, New York 07:00-10:00, all New York time) the bot trades the
+// FIRST bullish FVG presented after the session opens ("1st presentation",
+// applied to all three sessions per spec - up to 3 trades/day, no quality
+// filters so it fires nearly every day).
+//
+// Bullish FVG = low of candle 3 above high of candle 1 (gap between them).
+//   Entry: buy limit at the gap's TOP edge (candle 3's low) - fills the
+//          moment price dips back into the gap.
+//   Stop:  candle 1's low wick, exactly (no buffer, per spec).
+//   Target: nearest session high above entry (last completed Asian/London/
+//          NY high, or the current session's running high) - the liquidity
+//          draw. If none is above entry, or the nearest one is closer than
+//          the minimum R multiple, falls back to a fixed R:R.
+// Unfilled orders are cancelled when the session ends, if price closes
+// below the stop level first (gap invalidated), or on the daily-loss halt.
+// If the bot is busy when a session's first FVG appears, the next FVG in
+// that session is taken instead, so sessions aren't wasted.
+// Set commission in Properties to match your broker.
+
+strategy("ICT Session FVG Longs", overlay = true, initial_capital = 10000, currency = currency.USD, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100, max_labels_count = 100, max_lines_count = 100)
+
+//  Inputs
+grpS = "Sessions (New York time)"
+asianSess = input.session("2000-0000", "Asian session", group = grpS)
+londonSess = input.session("0200-0500", "London session", group = grpS)
+nySess = input.session("0700-1000", "New York session", group = grpS)
+
+grpF = "FVG"
+minGapUsd = input.float(0.0, "Min gap height ($, 0 = any)", minval = 0, step = 0.05, group = grpF)
+
+grpR = "Risk / exits"
+riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1, group = grpR)
+minTgtR = input.float(0.5, "Min target distance (R) to use session high", step = 0.25, group = grpR)
+rrFallback = input.float(2.0, "Fallback R:R (no usable session high)", step = 0.25, group = grpR)
+maxDayLoss = input.float(2.0, "Max daily loss halt (%)", step = 0.25, group = grpR)
+
+grpD = "Diagnostics"
+showDebug = input.bool(true, "Show diagnostics table", group = grpD)
+
+//  Session state (explicit New York timezone)
+tzNY = "America/New_York"
+inAsia = not na(time(timeframe.period, asianSess, tzNY))
+inLon = not na(time(timeframe.period, londonSess, tzNY))
+inNY = not na(time(timeframe.period, nySess, tzNY))
+sessId = inAsia ? 1 : inLon ? 2 : inNY ? 3 : 0
+
+var int wasSess = 0
+var float curSessH = na
+var float doneAsianH = na
+var float doneLonH = na
+var float doneNyH = na
+var bool tradedSess = false
+
+// Leaving a session: store its completed high as a liquidity level.
+if wasSess != 0 and sessId != wasSess
+    if wasSess == 1
+        doneAsianH := curSessH
+    else if wasSess == 2
+        doneLonH := curSessH
+    else
+        doneNyH := curSessH
+
+// Entering / inside a session: track the running high, reset per-session state.
+if sessId != 0
+    if sessId != wasSess
+        curSessH := high
+        tradedSess := false
+    else
+        curSessH := math.max(curSessH, high)
+
+//  Risk state
+var float dayStartEq = na
+if timeframe.change("D") or na(dayStartEq)
+    dayStartEq := strategy.equity
+dailyHalted = strategy.equity <= dayStartEq * (1 - maxDayLoss / 100)
+
+//  Funnel counters
+var int cntBars = 0
+var int cntFVG = 0
+var int cntOrders = 0
+var int cntCancel = 0
+
+//  Pending order lifecycle
+var bool pendingOrder = false
+var int pendSess = 0
+var float pendStop = na
+var int lastClosed = 0
+flat = strategy.position_size == 0
+
+// Order filled (position visible, or opened and closed within one bar).
+if pendingOrder and (not flat or strategy.closedtrades > lastClosed)
+    pendingOrder := false
+lastClosed := strategy.closedtrades
+
+// Cancel an unfilled order when its session ends, when price closes below
+// the stop level (gap no longer valid), or on the daily-loss halt.
+if pendingOrder and flat and (sessId != pendSess or close < pendStop or dailyHalted)
+    strategy.cancel("L")
+    pendingOrder := false
+    pendSess := 0
+    pendStop := na
+    cntCancel += 1
+
+//  Bullish FVG: gap between candle 1's high and candle 3's low
+bullFVG = low > high[2] and low - high[2] >= minGapUsd
+if bullFVG and sessId != 0
+    cntFVG += 1
+
+//  Entry: first (tradeable) bullish FVG of the session
+if bullFVG and sessId != 0 and not tradedSess and not pendingOrder and flat and not dailyHalted
+    entryPx = low
+    stopPx = low[2]
+    dist = entryPx - stopPx
+    if dist > 0
+        // Nearest session high sufficiently above entry, else fixed R:R.
+        minTgt = entryPx + minTgtR * dist
+        float tp = na
+        if not na(doneAsianH) and doneAsianH > minTgt and (na(tp) or doneAsianH < tp)
+            tp := doneAsianH
+        if not na(doneLonH) and doneLonH > minTgt and (na(tp) or doneLonH < tp)
+            tp := doneLonH
+        if not na(doneNyH) and doneNyH > minTgt and (na(tp) or doneNyH < tp)
+            tp := doneNyH
+        if not na(curSessH) and curSessH > minTgt and (na(tp) or curSessH < tp)
+            tp := curSessH
+        if na(tp)
+            tp := entryPx + rrFallback * dist
+        qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+        if qty > 0
+            strategy.entry("L", strategy.long, qty = qty, limit = entryPx)
+            strategy.exit("Lx", "L", stop = stopPx, limit = tp)
+            box.new(bar_index - 2, low, bar_index + 30, high[2], bgcolor = color.new(color.green, 85), border_color = color.new(color.green, 50))
+            pendingOrder := true
+            pendSess := sessId
+            pendStop := stopPx
+            tradedSess := true
+            cntOrders += 1
+
+//  Visuals
+plot(doneAsianH, "Asian high", color.new(color.orange, 30), style = plot.style_linebr)
+plot(doneLonH, "London high", color.new(color.blue, 30), style = plot.style_linebr)
+plot(doneNyH, "NY high", color.new(color.red, 30), style = plot.style_linebr)
+bgcolor(inAsia ? color.new(color.gray, 96) : inLon ? color.new(color.blue, 94) : inNY ? color.new(color.orange, 94) : na)
+plotchar(dailyHalted, "Daily halt", "X", location.top, color.orange, size = size.tiny)
+
+//  Diagnostics
+cntBars += 1
+sessName = sessId == 1 ? "Asian" : sessId == 2 ? "London" : sessId == 3 ? "New York" : "off-session"
+stateTxt = sessId == 0 ? "idle" : tradedSess ? sessName + ": traded" : sessName + ": hunting FVG"
+
+var table diag = showDebug ? table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 80), border_width = 1, border_color = color.new(color.gray, 70)) : na
+
+f_row(int r, string k, string v) =>
+    table.cell(diag, 0, r, k, text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(diag, 1, r, v, text_color = color.white, text_halign = text.align_right, text_size = size.small)
+
+if showDebug and barstate.islast
+    f_row(0, "Chart TF", timeframe.period == "1" ? "1-min OK" : "WRONG TF - USE 1-MIN!")
+    f_row(1, "State", stateTxt)
+    f_row(2, "Bars loaded", str.tostring(cntBars))
+    f_row(3, "Session FVGs seen", str.tostring(cntFVG))
+    f_row(4, "Orders placed", str.tostring(cntOrders))
+    f_row(5, "Cancelled unfilled", str.tostring(cntCancel))
+    f_row(6, "Trades", str.tostring(strategy.closedtrades + strategy.opentrades))
+
+wasSess := sessId
