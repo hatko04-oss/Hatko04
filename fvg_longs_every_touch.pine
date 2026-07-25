@@ -10,7 +10,7 @@
 // A zone dies when price closes below its bottom; its order is cancelled.
 // Stop is frozen at zone creation (below the bottom, min ATR distance);
 // take profit is a quick fixed R scalp (default 1R).
-strategy("FVG Longs HF", overlay = true, initial_capital = 10000, pyramiding = 100, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
+strategy("FVG Longs HF", overlay = true, initial_capital = 10000, pyramiding = 100, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100, margin_long = 0, margin_short = 0)
 
 minGap = input.float(0.0, "Min gap size (x ATR, 0 = any)", minval = 0, step = 0.05)
 stopBufTicks = input.int(3, "Stop buffer below zone (ticks)", minval = 0)

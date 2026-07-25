@@ -10,7 +10,7 @@
 // fully reclaimed); its order is cancelled.
 // Stop is frozen at zone creation (above the top, min ATR distance);
 // take profit is a quick fixed R scalp (default 1R).
-strategy("FVG Shorts HF", overlay = true, initial_capital = 10000, pyramiding = 100, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
+strategy("FVG Shorts HF", overlay = true, initial_capital = 10000, pyramiding = 100, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100, margin_long = 0, margin_short = 0)
 
 minGap = input.float(0.0, "Min gap size (x ATR, 0 = any)", minval = 0, step = 0.05)
 stopBufTicks = input.int(3, "Stop buffer above zone (ticks)", minval = 0)
@@ -61,3 +61,13 @@ if array.size(zTop) > 0
             if qty > 0
                 strategy.entry(id, strategy.short, qty = qty, limit = b)
                 strategy.exit("x" + id, id, stop = stopPx, limit = b - rr * dist)
+
+//  Diagnostics: if trades stay at 0, this shows where the funnel dies.
+var table diag = table.new(position.top_right, 2, 3, bgcolor = color.new(color.black, 80))
+if barstate.islast
+    table.cell(diag, 0, 0, "Zones created", text_color = color.white, text_size = size.small)
+    table.cell(diag, 1, 0, str.tostring(n), text_color = color.white, text_size = size.small)
+    table.cell(diag, 0, 1, "Zones alive", text_color = color.white, text_size = size.small)
+    table.cell(diag, 1, 1, str.tostring(array.size(zTop)), text_color = color.white, text_size = size.small)
+    table.cell(diag, 0, 2, "Trades", text_color = color.white, text_size = size.small)
+    table.cell(diag, 1, 2, str.tostring(strategy.closedtrades + strategy.opentrades), text_color = color.white, text_size = size.small)
