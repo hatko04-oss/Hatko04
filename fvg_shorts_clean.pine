@@ -1,0 +1,48 @@
+//@version=6
+// FVG Shorts Clean - big gaps only, tight stop, clean-low targets. Any TF.
+// Shorts at market on each bearish FVG at least X * ATR tall (stacks up to
+// 20). Stop: just above the gap's top edge (candle 1's low + ticks) - small
+// stop, bigger R. TP: nearest clean (unswept) ICT low below entry, fixed R
+// fallback if none. Only halt: equity down 50%.
+strategy("FVG Shorts Clean", overlay = true, initial_capital = 10000, pyramiding = 20, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
+
+minGapAtr = input.float(0.5, "Min gap size (x ATR)", step = 0.1)
+stopBufTicks = input.int(3, "Stop buffer above gap (ticks)", minval = 0)
+riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1)
+tgtSwing = input.int(5, "Clean-low swing length", minval = 2)
+rrFallback = input.float(4.0, "Fallback R:R (no clean low)", step = 0.5)
+maxDD = input.float(50.0, "Halt when account down (%)", step = 5)
+
+atr = ta.atr(14)
+var array<float> cleanLows = array.new_float()
+pl = ta.pivotlow(low, tgtSwing, tgtSwing)
+if not na(pl)
+    array.unshift(cleanLows, pl)
+if array.size(cleanLows) > 0
+    for i = array.size(cleanLows) - 1 to 0
+        if low < array.get(cleanLows, i)
+            array.remove(cleanLows, i)
+
+bearFVG = high < low[2] and low[2] - high >= minGapAtr * atr
+halted = strategy.equity <= strategy.initial_capital * (1 - maxDD / 100)
+
+var int n = 0
+if bearFVG and not halted and strategy.opentrades < 20
+    stopPx = low[2] + stopBufTicks * syminfo.mintick
+    dist = stopPx - close
+    float tp = na
+    if array.size(cleanLows) > 0
+        for i = 0 to array.size(cleanLows) - 1
+            v = array.get(cleanLows, i)
+            if v < close and (na(tp) or v > tp)
+                tp := v
+    if na(tp)
+        tp := close - rrFallback * dist
+    if dist > 0 and tp < close
+        qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+        n += 1
+        strategy.entry("S" + str.tostring(n), strategy.short, qty = qty)
+        strategy.exit("x" + str.tostring(n), "S" + str.tostring(n), stop = stopPx, limit = tp)
+        box.new(bar_index - 2, low[2], bar_index + 20, high, bgcolor = color.new(color.maroon, 85))
+
+plotchar(halted, "Halted", "X", location.top, color.red, size = size.tiny)
