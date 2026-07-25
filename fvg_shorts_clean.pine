@@ -11,9 +11,12 @@ stopBufTicks = input.int(3, "Stop buffer above gap (ticks)", minval = 0)
 riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1)
 tgtSwing = input.int(5, "Clean-low swing length", minval = 2)
 rrFallback = input.float(4.0, "Fallback R:R (no clean low)", step = 0.5)
-maxDD = input.float(50.0, "Halt when account down (%)", step = 5)
+emaLen = input.int(200, "Only short below EMA (length)", minval = 10)
+maxOpen = input.int(3, "Max stacked trades", minval = 1, maxval = 20)
+maxDD = input.float(20.0, "Halt when account down (%)", step = 5)
 
 atr = ta.atr(14)
+ema = ta.ema(close, emaLen)
 var array<float> cleanLows = array.new_float()
 pl = ta.pivotlow(low, tgtSwing, tgtSwing)
 if not na(pl)
@@ -27,7 +30,7 @@ bearFVG = high < low[2] and low[2] - high >= minGapAtr * atr
 halted = strategy.equity <= strategy.initial_capital * (1 - maxDD / 100)
 
 var int n = 0
-if bearFVG and not halted and strategy.opentrades < 20
+if bearFVG and close < ema and not halted and strategy.opentrades < maxOpen
     stopPx = low[2] + stopBufTicks * syminfo.mintick
     dist = stopPx - close
     float tp = na
@@ -45,4 +48,5 @@ if bearFVG and not halted and strategy.opentrades < 20
         strategy.exit("x" + str.tostring(n), "S" + str.tostring(n), stop = stopPx, limit = tp)
         box.new(bar_index - 2, low[2], bar_index + 20, high, bgcolor = color.new(color.maroon, 85))
 
+plot(ema, "Trend EMA", color.new(color.orange, 40))
 plotchar(halted, "Halted", "X", location.top, color.red, size = size.tiny)
