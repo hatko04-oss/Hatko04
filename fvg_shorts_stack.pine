@@ -1,0 +1,61 @@
+//@version=6
+// FVG Shorts Stack - pure FVG bot, any symbol, any timeframe.
+// Shorts only. Sells at MARKET on every bearish FVG (candle 3's high below
+// candle 1's low) and stacks positions (pyramiding up to 20 open entries).
+// Stop: candle 1's high wick plus a few ticks. Take profit: the next clean
+// (unswept) swing low below entry - the liquidity the algorithm targets -
+// with a fixed R fallback when no clean low is far enough away.
+// Only halt: equity down 50% (configurable). Trade small - stacking means
+// several positions can lose at once.
+
+strategy("FVG Shorts Stack", overlay = true, initial_capital = 10000, currency = currency.USD, pyramiding = 20, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
+
+//  Inputs
+minGap = input.float(0.0, "Min gap height ($, 0 = any)", minval = 0, step = 0.05)
+stopBufTicks = input.int(5, "Stop buffer above candle 1 wick (ticks)", minval = 0)
+riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1)
+tgtSwing = input.int(5, "Clean-low swing length", minval = 2)
+minTgtR = input.float(1.0, "Min target distance (R) to use clean low", step = 0.25)
+rrFallback = input.float(4.0, "Fallback R:R (no clean low)", step = 0.5)
+maxDD = input.float(50.0, "Halt when account is down (%)", step = 5)
+
+//  Clean lows: swing lows price has not traded below yet
+var array<float> cleanLows = array.new_float()
+pl = ta.pivotlow(low, tgtSwing, tgtSwing)
+if not na(pl)
+    array.unshift(cleanLows, pl)
+    if array.size(cleanLows) > 50
+        array.pop(cleanLows)
+if array.size(cleanLows) > 0
+    for i = array.size(cleanLows) - 1 to 0
+        if low < array.get(cleanLows, i)
+            array.remove(cleanLows, i)
+
+//  Bearish FVG + halt
+bearFVG = high < low[2] and low[2] - high >= minGap
+halted = strategy.equity <= strategy.initial_capital * (1 - maxDD / 100)
+
+//  Entry: short every bearish FVG, each with its own stop and target
+var int tradeN = 0
+if bearFVG and not halted and strategy.opentrades < 20
+    stopPx = high[2] + stopBufTicks * syminfo.mintick
+    dist = stopPx - close
+    if dist > 0
+        // Nearest clean low at least minTgtR below entry, else fallback R.
+        maxTgt = close - minTgtR * dist
+        float tp = na
+        if array.size(cleanLows) > 0
+            for i = 0 to array.size(cleanLows) - 1
+                v = array.get(cleanLows, i)
+                if v < maxTgt and (na(tp) or v > tp)
+                    tp := v
+        if na(tp)
+            tp := close - rrFallback * dist
+        qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+        if qty > 0
+            tradeN += 1
+            strategy.entry("S" + str.tostring(tradeN), strategy.short, qty = qty)
+            strategy.exit("x" + str.tostring(tradeN), "S" + str.tostring(tradeN), stop = stopPx, limit = tp)
+            box.new(bar_index - 2, low[2], bar_index + 20, high, bgcolor = color.new(color.maroon, 85), border_color = color.new(color.maroon, 50))
+
+plotchar(halted, "Halted", "X", location.top, color.red, size = size.tiny)
