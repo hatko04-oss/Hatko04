@@ -1,0 +1,265 @@
+//@version=6
+// ICT Killzone Bot v2 - Asian range sweep + MSS + order block entries.
+// Playbook (per Inner Circle Trader methodology, both directions):
+//   1. Track the Asian session range (20:00-00:00 New York time) and the
+//      previous day's high/low as liquidity pools.
+//   2. During the London (02:00-05:00 NY) or New York (07:00-10:00 NY)
+//      killzone, wait for a liquidity sweep: a wick beyond one of those
+//      levels that closes back inside (the manipulation / stop hunt).
+//   3. After a sweep, wait for a market structure shift with displacement:
+//      a close beyond the last chart swing low/high with a large body.
+//   4. Entry: limit order at the edge of the order block the impulse left
+//      behind (last opposite-color candle before the MSS). Stop beyond the
+//      order block plus an ATR buffer.
+//   5. TP1 closes half the position at a fixed R multiple; the runner
+//      targets the previous day's low/high (fallback: a larger R multiple),
+//      with optional break-even after TP1.
+//   6. Unfilled orders are cancelled when the killzone ends. One setup per
+//      killzone.
+// The chart timeframe IS the signal timeframe - M5 or M15 recommended
+// (XAUUSD, EURUSD, indices). No request.security anywhere, so there is
+// nothing to repaint. Set commission in Properties to match your broker;
+// enable bar magnifier if your plan has it.
+
+strategy("ICT Killzone Bot v2", overlay = true, initial_capital = 10000, currency = currency.USD, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100, max_labels_count = 300, max_lines_count = 100)
+
+//  Inputs
+grpS = "Sessions (New York time)"
+asianSess = input.session("2000-0000", "Asian range", group = grpS)
+londonKZ = input.session("0200-0500", "London killzone", group = grpS)
+nyKZ = input.session("0700-1000", "New York killzone", group = grpS)
+
+grpSig = "Signals"
+allowLongs = input.bool(true, "Allow longs", group = grpSig)
+allowShorts = input.bool(true, "Allow shorts", group = grpSig)
+mssSwing = input.int(3, "MSS swing length", minval = 2, group = grpSig)
+dispMul = input.float(0.5, "MSS displacement body (x ATR)", step = 0.1, group = grpSig)
+obLookback = input.int(15, "Order block lookback (bars)", minval = 3, group = grpSig)
+usePD = input.bool(false, "Premium/discount filter (vs prev-day mid)", group = grpSig)
+
+grpR = "Risk / exits"
+riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1, group = grpR)
+stopBufMul = input.float(0.25, "Stop buffer beyond OB (x ATR)", step = 0.05, group = grpR)
+rr1 = input.float(3.0, "TP1 R multiple (closes 50%)", step = 0.25, group = grpR)
+rr2 = input.float(5.0, "Runner fallback R multiple", step = 0.25, group = grpR)
+beAfterTP1 = input.bool(true, "Move stop to break-even after TP1", group = grpR)
+maxDayLoss = input.float(2.0, "Max daily loss halt (%)", step = 0.25, group = grpR)
+
+grpD = "Diagnostics"
+showDebug = input.bool(true, "Show diagnostics table", group = grpD)
+
+//  Sessions (explicit New York timezone = ICT's EST/EDT convention)
+tzNY = "America/New_York"
+atr = ta.atr(14)
+body = math.abs(close - open)
+
+inAsia = not na(time(timeframe.period, asianSess, tzNY))
+inLKZ = not na(time(timeframe.period, londonKZ, tzNY))
+inNKZ = not na(time(timeframe.period, nyKZ, tzNY))
+inKZ = inLKZ or inNKZ
+
+// Previous-bar session state via vars (bool[1] is na on the first bar).
+var bool wasKZ = false
+var bool wasAsia = false
+kzStart = inKZ and not wasKZ
+
+//  Asian range
+var float asianH = na
+var float asianL = na
+if inAsia
+    if not wasAsia
+        asianH := high
+        asianL := low
+    else
+        asianH := math.max(asianH, high)
+        asianL := math.min(asianL, low)
+
+//  Daily levels (previous day high/low = liquidity + runner target)
+var float dayH = na
+var float dayL = na
+var float prevDayH = na
+var float prevDayL = na
+if timeframe.change("D")
+    prevDayH := dayH
+    prevDayL := dayL
+    dayH := high
+    dayL := low
+else
+    dayH := math.max(nz(dayH, high), high)
+    dayL := math.min(nz(dayL, low), low)
+
+//  Chart swings for MSS detection
+ph = ta.pivothigh(high, mssSwing, mssSwing)
+pl = ta.pivotlow(low, mssSwing, mssSwing)
+var float lastSH = na
+var float lastSL = na
+if not na(ph)
+    lastSH := ph
+if not na(pl)
+    lastSL := pl
+
+//  Risk state
+var float dayStartEq = na
+if timeframe.change("D") or na(dayStartEq)
+    dayStartEq := strategy.equity
+dailyHalted = strategy.equity <= dayStartEq * (1 - maxDayLoss / 100)
+
+//  Funnel counters
+var int cntBars = 0
+var int cntSweepH = 0
+var int cntSweepL = 0
+var int cntMSS = 0
+var int cntOrders = 0
+var int cntKzCancel = 0
+var int cntPDblock = 0
+
+//  Pending order / position lifecycle
+var bool pendingOrder = false
+var bool pendShort = false
+var float storedTp2 = na
+var float initQty = na
+var bool beDone = false
+var int lastClosed = 0
+flat = strategy.position_size == 0
+
+// Order filled (position visible, or opened and closed within one bar).
+if pendingOrder and (not flat or strategy.closedtrades > lastClosed)
+    pendingOrder := false
+lastClosed := strategy.closedtrades
+
+// Killzone over or daily halt: pull any unfilled order.
+if pendingOrder and flat and (not inKZ or dailyHalted)
+    strategy.cancel("S")
+    strategy.cancel("L")
+    pendingOrder := false
+    cntKzCancel += 1
+
+// Break-even for the runner once TP1's partial has filled.
+if flat
+    beDone := false
+if not flat and beAfterTP1 and not beDone and not na(initQty)
+    if math.abs(strategy.position_size) < initQty * 0.99
+        strategy.exit("TP2", pendShort ? "S" : "L", qty_percent = 100, limit = storedTp2, stop = strategy.position_avg_price)
+        beDone := true
+
+//  Killzone state machine
+var bool sweptHigh = false
+var bool sweptLow = false
+var bool tradedKZ = false
+if kzStart
+    sweptHigh := false
+    sweptLow := false
+    tradedKZ := false
+
+// 1) Liquidity sweep: wick beyond a pool, close back inside.
+if inKZ and not tradedKZ
+    swpH = (not na(asianH) and high > asianH and close < asianH) or (not na(prevDayH) and high > prevDayH and close < prevDayH)
+    swpL = (not na(asianL) and low < asianL and close > asianL) or (not na(prevDayL) and low < prevDayL and close > prevDayL)
+    if swpH and not sweptHigh
+        sweptHigh := true
+        cntSweepH += 1
+        label.new(bar_index, high, "SwpH", style = label.style_label_down, color = color.new(color.red, 40), textcolor = color.white, size = size.tiny)
+    if swpL and not sweptLow
+        sweptLow := true
+        cntSweepL += 1
+        label.new(bar_index, low, "SwpL", style = label.style_label_up, color = color.new(color.teal, 40), textcolor = color.white, size = size.tiny)
+
+// 2) MSS with displacement, then 3) order block limit entry.
+pdMid = not na(prevDayH) and not na(prevDayL) ? (prevDayH + prevDayL) / 2 : na
+mssDown = sweptHigh and not na(lastSL) and close < lastSL and close < open and body > dispMul * atr
+mssUp = sweptLow and not na(lastSH) and close > lastSH and close > open and body > dispMul * atr
+
+if inKZ and not tradedKZ and not pendingOrder and flat and not dailyHalted
+    if allowShorts and mssDown
+        cntMSS += 1
+        label.new(bar_index, low, "MSS", style = label.style_label_up, color = color.new(color.maroon, 40), textcolor = color.white, size = size.tiny)
+        int ob = -1
+        for i = 1 to obLookback
+            if close[i] > open[i]
+                ob := i
+                break
+        if ob > 0
+            entryPx = low[ob]
+            stopPx = high[ob] + stopBufMul * atr
+            dist = stopPx - entryPx
+            pdOK = not usePD or na(pdMid) or entryPx > pdMid
+            if not pdOK
+                cntPDblock += 1
+            if pdOK and dist > 0 and entryPx > close
+                tp1 = entryPx - rr1 * dist
+                tp2 = not na(prevDayL) and prevDayL < tp1 ? prevDayL : entryPx - rr2 * dist
+                qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+                if qty > 0
+                    strategy.entry("S", strategy.short, qty = qty, limit = entryPx)
+                    strategy.exit("TP1", "S", qty_percent = 50, limit = tp1, stop = stopPx)
+                    strategy.exit("TP2", "S", qty_percent = 50, limit = tp2, stop = stopPx)
+                    box.new(bar_index - ob, high[ob], bar_index + 20, low[ob], bgcolor = color.new(color.maroon, 85), border_color = color.new(color.maroon, 50))
+                    pendingOrder := true
+                    pendShort := true
+                    storedTp2 := tp2
+                    initQty := qty
+                    tradedKZ := true
+                    cntOrders += 1
+    else if allowLongs and mssUp
+        cntMSS += 1
+        label.new(bar_index, high, "MSS", style = label.style_label_down, color = color.new(color.green, 40), textcolor = color.white, size = size.tiny)
+        int ob = -1
+        for i = 1 to obLookback
+            if close[i] < open[i]
+                ob := i
+                break
+        if ob > 0
+            entryPx = high[ob]
+            stopPx = low[ob] - stopBufMul * atr
+            dist = entryPx - stopPx
+            pdOK = not usePD or na(pdMid) or entryPx < pdMid
+            if not pdOK
+                cntPDblock += 1
+            if pdOK and dist > 0 and entryPx < close
+                tp1 = entryPx + rr1 * dist
+                tp2 = not na(prevDayH) and prevDayH > tp1 ? prevDayH : entryPx + rr2 * dist
+                qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+                if qty > 0
+                    strategy.entry("L", strategy.long, qty = qty, limit = entryPx)
+                    strategy.exit("TP1", "L", qty_percent = 50, limit = tp1, stop = stopPx)
+                    strategy.exit("TP2", "L", qty_percent = 50, limit = tp2, stop = stopPx)
+                    box.new(bar_index - ob, high[ob], bar_index + 20, low[ob], bgcolor = color.new(color.green, 85), border_color = color.new(color.green, 50))
+                    pendingOrder := true
+                    pendShort := false
+                    storedTp2 := tp2
+                    initQty := qty
+                    tradedKZ := true
+                    cntOrders += 1
+
+//  Visuals
+plot(inAsia or inKZ ? asianH : na, "Asian high", color.new(color.orange, 20), style = plot.style_linebr)
+plot(inAsia or inKZ ? asianL : na, "Asian low", color.new(color.orange, 20), style = plot.style_linebr)
+plot(prevDayH, "Prev day high", color.new(color.gray, 40), style = plot.style_linebr)
+plot(prevDayL, "Prev day low", color.new(color.gray, 40), style = plot.style_linebr)
+bgcolor(inLKZ ? color.new(color.blue, 94) : inNKZ ? color.new(color.orange, 94) : inAsia ? color.new(color.gray, 96) : na)
+plotchar(dailyHalted, "Daily halt", "X", location.top, color.orange, size = size.tiny)
+
+//  Diagnostics
+cntBars += 1
+stateTxt = tradedKZ ? "traded this KZ" : sweptHigh and sweptLow ? "swept H+L" : sweptHigh ? "swept high" : sweptLow ? "swept low" : inKZ ? "hunting sweep" : "idle"
+
+var table diag = showDebug ? table.new(position.top_right, 2, 9, bgcolor = color.new(color.black, 80), border_width = 1, border_color = color.new(color.gray, 70)) : na
+
+f_row(int r, string k, string v) =>
+    table.cell(diag, 0, r, k, text_color = color.white, text_halign = text.align_left, text_size = size.small)
+    table.cell(diag, 1, r, v, text_color = color.white, text_halign = text.align_right, text_size = size.small)
+
+if showDebug and barstate.islast
+    f_row(0, "State", stateTxt)
+    f_row(1, "Bars loaded", str.tostring(cntBars))
+    f_row(2, "Sweeps high", str.tostring(cntSweepH))
+    f_row(3, "Sweeps low", str.tostring(cntSweepL))
+    f_row(4, "MSS confirmed", str.tostring(cntMSS))
+    f_row(5, "Orders placed", str.tostring(cntOrders))
+    f_row(6, "KZ-end cancels", str.tostring(cntKzCancel))
+    f_row(7, "P/D blocks", str.tostring(cntPDblock))
+    f_row(8, "Trades", str.tostring(strategy.closedtrades + strategy.opentrades))
+
+// Previous-bar session state, updated last.
+wasKZ := inKZ
+wasAsia := inAsia
