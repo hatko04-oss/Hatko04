@@ -1,58 +1,61 @@
 //@version=6
-// FVG Longs Every Touch - the simplest version. Longs only, no limits.
-// Every bullish FVG (candle 3's low above candle 1's high) becomes a zone.
-// EVERY time price comes back down into a zone, buy at market - the zone
-// re-arms when price leaves it and trades again on the next dip, until
-// price closes below the zone's bottom (then the zone is gone).
-// Stop: below the zone bottom, but at least minStopAtr away so position
-// size stays sane. TP: fixed R multiple. No trend filter, no halt, no cap.
-strategy("FVG Longs Every Touch", overlay = true, initial_capital = 10000, pyramiding = 100, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
+// FVG Longs HF - high-frequency version of the every-touch bot.
+// (True microsecond HFT is impossible on TradingView - this is maximum-
+// turnover intrabar scalping, the fastest Pine can execute.)
+// Every bullish FVG zone keeps a resting BUY LIMIT at its top edge, so a
+// touch fills INTRABAR at the touch price - no waiting for bar close. The
+// order re-arms whenever price is back above the zone, so every touch
+// trades, even while earlier fills are still open (pyramiding 100). A
+// zone dies when price closes below its bottom; its order is cancelled.
+// Stop is frozen at zone creation (below the bottom, min ATR distance);
+// take profit is a quick fixed R scalp (default 1R).
+strategy("FVG Longs HF", overlay = true, initial_capital = 10000, pyramiding = 100, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
 
 minGap = input.float(0.0, "Min gap size (x ATR, 0 = any)", minval = 0, step = 0.05)
 stopBufTicks = input.int(3, "Stop buffer below zone (ticks)", minval = 0)
-minStopAtr = input.float(0.3, "Min stop distance (x ATR)", step = 0.05)
+minStopAtr = input.float(0.2, "Min stop distance (x ATR)", step = 0.05)
 riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1)
-rr = input.float(2.0, "Take profit (R multiple)", step = 0.25)
+rr = input.float(1.0, "Take profit (R multiple)", step = 0.25)
 
 atr = ta.atr(14)
 
-//  Zones + retrace detection (zOut = price was above the zone last bar)
 var array<float> zTop = array.new_float()
 var array<float> zBot = array.new_float()
-var array<bool> zOut = array.new<bool>()
-float hitBot = na
+var array<float> zStop = array.new_float()
+var array<int> zId = array.new_int()
+var int n = 0
+
+//  Manage zones: dead zones cancel their order; live zones keep a resting
+//  buy limit at the top edge whenever price is above the zone.
 if array.size(zTop) > 0
     for i = array.size(zTop) - 1 to 0
         t = array.get(zTop, i)
-        b = array.get(zBot, i)
-        if close < b
+        id = "Z" + str.tostring(array.get(zId, i))
+        if close < array.get(zBot, i)
+            strategy.cancel(id)
             array.remove(zTop, i)
             array.remove(zBot, i)
-            array.remove(zOut, i)
-        else
-            if low <= t and array.get(zOut, i) and (na(hitBot) or b > hitBot)
-                hitBot := b
-            array.set(zOut, i, low > t)
+            array.remove(zStop, i)
+            array.remove(zId, i)
+        else if low > t
+            stopPx = array.get(zStop, i)
+            dist = t - stopPx
+            qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+            if qty > 0
+                strategy.entry(id, strategy.long, qty = qty, limit = t)
+                strategy.exit("x" + id, id, stop = stopPx, limit = t + rr * dist)
 
-//  Every bullish FVG becomes a zone (tradeable from the next bar)
+//  Every bullish FVG becomes a zone with its own resting order slot.
 if low > high[2] and low - high[2] >= minGap * atr
+    n += 1
     array.unshift(zTop, low)
     array.unshift(zBot, high[2])
-    array.unshift(zOut, true)
+    array.unshift(zStop, math.min(high[2] - stopBufTicks * syminfo.mintick, low - minStopAtr * atr))
+    array.unshift(zId, n)
     box.new(bar_index - 2, low, bar_index + 30, high[2], bgcolor = color.new(color.green, 85))
     if array.size(zTop) > 20
+        strategy.cancel("Z" + str.tostring(array.get(zId, array.size(zId) - 1)))
         array.pop(zTop)
         array.pop(zBot)
-        array.pop(zOut)
-
-//  Buy on every fresh retrace into a zone
-var int n = 0
-if not na(hitBot)
-    stopPx = math.min(hitBot - stopBufTicks * syminfo.mintick, close - minStopAtr * atr)
-    dist = close - stopPx
-    if dist > 0
-        qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
-        if qty > 0
-            n += 1
-            strategy.entry("L" + str.tostring(n), strategy.long, qty = qty)
-            strategy.exit("x" + str.tostring(n), "L" + str.tostring(n), stop = stopPx, limit = close + rr * dist)
+        array.pop(zStop)
+        array.pop(zId)
