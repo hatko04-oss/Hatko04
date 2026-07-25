@@ -1,0 +1,56 @@
+//@version=6
+// ICT Session FVG Shorts - simple build for 1-MINUTE charts.
+// Shorts only. In each session (Asian, London, New York - NY time) the bot
+// sells at MARKET on the first bearish FVG that forms (candle 3's high
+// below candle 1's low), so it actually fills - at least one trade almost
+// every day, up to three.
+// Stop: candle 1's high wick, exactly. Take profit: big fixed R multiple
+// (default 4R). Trading only halts if equity drops to half the account.
+
+strategy("ICT Session FVG Shorts", overlay = true, initial_capital = 10000, currency = currency.USD, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
+
+//  Inputs
+asianSess = input.session("2000-0000", "Asian session (NY time)")
+londonSess = input.session("0200-0500", "London session (NY time)")
+nySess = input.session("0700-1000", "New York session (NY time)")
+minGap = input.float(0.0, "Min gap height ($, 0 = any)", minval = 0, step = 0.05)
+riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1)
+rr = input.float(4.0, "Take profit (R multiple)", step = 0.5)
+maxDD = input.float(50.0, "Halt when account is down (%)", step = 5)
+
+//  Sessions
+tzNY = "America/New_York"
+inAsia = not na(time(timeframe.period, asianSess, tzNY))
+inLon = not na(time(timeframe.period, londonSess, tzNY))
+inNY = not na(time(timeframe.period, nySess, tzNY))
+sessId = inAsia ? 1 : inLon ? 2 : inNY ? 3 : 0
+
+// One trade per session.
+var int wasSess = 0
+var bool tradedSess = false
+if sessId != 0 and sessId != wasSess
+    tradedSess := false
+
+// Only stop trading after losing half the account.
+halted = strategy.equity <= strategy.initial_capital * (1 - maxDD / 100)
+
+//  Bearish FVG: candle 3's high below candle 1's low
+bearFVG = high < low[2] and low[2] - high >= minGap
+
+//  Entry: market short on the session's first bearish FVG
+if bearFVG and sessId != 0 and not tradedSess and strategy.position_size == 0 and not halted
+    stopPx = high[2]
+    dist = stopPx - close
+    if dist > 0
+        qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+        if qty > 0
+            strategy.entry("S", strategy.short, qty = qty)
+            strategy.exit("Sx", "S", stop = stopPx, limit = close - rr * dist)
+            box.new(bar_index - 2, low[2], bar_index + 30, high, bgcolor = color.new(color.maroon, 85), border_color = color.new(color.maroon, 50))
+            tradedSess := true
+
+//  Visuals
+bgcolor(inAsia ? color.new(color.gray, 96) : inLon ? color.new(color.blue, 94) : inNY ? color.new(color.orange, 94) : na)
+plotchar(halted, "Halted", "X", location.top, color.red, size = size.tiny)
+
+wasSess := sessId
