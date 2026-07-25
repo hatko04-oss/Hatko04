@@ -1,18 +1,19 @@
 //@version=6
 // FVG Longs Clean + magnets - longs only, any symbol, any timeframe.
-// Buys at market on each bullish FVG (candle 3's low above candle 1's
-// high, >= X * ATR tall) while price is above the trend EMA, stacking up
-// to maxOpen trades. Stop: just below the gap's bottom edge.
+// Medium-sized bullish FVGs (gap between min and max x ATR) are stored as
+// zones. EVERY retrace back down into a zone triggers a market buy; when
+// price leaves the zone and dips back again, it trades again. A zone dies
+// when price closes below its bottom. Stop: below the zone bottom - ticks.
 // TP: the NEAREST magnet above entry, from three kinds -
 //   1. clean (unswept) ICT swing highs,
 //   2. NWOG / NDOG midpoints (new week / day opening gaps),
 //   3. volume imbalance midpoints (body gaps whose wicks still overlap).
-// A magnet is removed once price trades through it. Fixed R fallback if
-// no magnet sits above entry. Halts if equity drops maxDD %.
+// Magnets vanish once price trades through them; fixed R fallback if none.
 strategy("FVG Longs Clean", overlay = true, initial_capital = 10000, pyramiding = 20, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
 
-minGapAtr = input.float(0.25, "Min gap size (x ATR)", step = 0.05)
-stopBufTicks = input.int(3, "Stop buffer below gap (ticks)", minval = 0)
+minGapAtr = input.float(0.3, "Min gap size (x ATR)", step = 0.05)
+maxGapAtr = input.float(1.0, "Max gap size (x ATR)", step = 0.1)
+stopBufTicks = input.int(3, "Stop buffer below zone (ticks)", minval = 0)
 riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1)
 tgtSwing = input.int(5, "Clean-high swing length", minval = 2)
 rrFallback = input.float(4.0, "Fallback R:R (no magnet above)", step = 0.5)
@@ -23,7 +24,6 @@ maxDD = input.float(20.0, "Halt when account down (%)", step = 5)
 atr = ta.atr(14)
 ema = ta.ema(close, emaLen)
 
-// Remove magnets price traded through this bar.
 f_sweepTouched(array<float> a) =>
     if array.size(a) > 0
         for i = array.size(a) - 1 to 0
@@ -31,7 +31,6 @@ f_sweepTouched(array<float> a) =>
             if high >= v and low <= v
                 array.remove(a, i)
 
-// Nearest level above p, carrying the best found so far across arrays.
 f_nearestAbove(array<float> a, float p, float best0) =>
     float best = best0
     if array.size(a) > 0
@@ -69,12 +68,43 @@ if array.size(viMids) > 20
     array.pop(viMids)
 f_sweepTouched(viMids)
 
-bullFVG = low > high[2] and low - high[2] >= minGapAtr * atr
 halted = strategy.equity <= strategy.initial_capital * (1 - maxDD / 100)
 
+//  FVG zones: check retraces on existing zones, drop broken ones.
+// zOut = price was above the zone last bar, so this dip is a fresh retrace.
+var array<float> zTop = array.new_float()
+var array<float> zBot = array.new_float()
+var array<bool> zOut = array.new<bool>()
+float hitBot = na
+if array.size(zTop) > 0
+    for i = array.size(zTop) - 1 to 0
+        t = array.get(zTop, i)
+        b = array.get(zBot, i)
+        if close < b
+            array.remove(zTop, i)
+            array.remove(zBot, i)
+            array.remove(zOut, i)
+        else
+            if low <= t and array.get(zOut, i) and (na(hitBot) or b > hitBot)
+                hitBot := b
+            array.set(zOut, i, low > t)
+
+//  New medium-sized bullish FVG becomes a zone (checked from next bar on).
+gapSz = low - high[2]
+if low > high[2] and gapSz >= minGapAtr * atr and gapSz <= maxGapAtr * atr
+    array.unshift(zTop, low)
+    array.unshift(zBot, high[2])
+    array.unshift(zOut, true)
+    box.new(bar_index - 2, low, bar_index + 30, high[2], bgcolor = color.new(color.green, 85))
+    if array.size(zTop) > 10
+        array.pop(zTop)
+        array.pop(zBot)
+        array.pop(zOut)
+
+//  Entry: one market buy per bar on the freshest retrace
 var int n = 0
-if bullFVG and close > ema and not halted and strategy.opentrades < maxOpen
-    stopPx = high[2] - stopBufTicks * syminfo.mintick
+if not na(hitBot) and close > ema and not halted and strategy.opentrades < maxOpen
+    stopPx = hitBot - stopBufTicks * syminfo.mintick
     dist = close - stopPx
     float tp = f_nearestAbove(cleanHighs, close, na)
     tp := f_nearestAbove(gapMids, close, tp)
@@ -86,7 +116,6 @@ if bullFVG and close > ema and not halted and strategy.opentrades < maxOpen
         n += 1
         strategy.entry("L" + str.tostring(n), strategy.long, qty = qty)
         strategy.exit("x" + str.tostring(n), "L" + str.tostring(n), stop = stopPx, limit = tp)
-        box.new(bar_index - 2, low, bar_index + 20, high[2], bgcolor = color.new(color.green, 85))
 
 plot(ema, "Trend EMA", color.new(color.orange, 40))
 plot(array.size(gapMids) > 0 ? array.get(gapMids, 0) : na, "Latest NWOG/NDOG mid", color.new(color.purple, 30), style = plot.style_linebr)
