@@ -1,0 +1,63 @@
+//@version=6
+// FVG Shorts HF - the every-touch scalper mirrored for shorts (sibi).
+// Every bearish FVG (candle 3's high below candle 1's low - a sell-side
+// imbalance) becomes a zone with a resting SELL LIMIT at its bottom edge
+// from the moment it forms, so a retrace up into the gap fills INTRABAR
+// at the touch price. The order re-arms whenever the bar closes back at/
+// below the zone bottom (a wick into the zone that closes below still
+// re-arms), so every touch trades, even while earlier fills are open
+// (pyramiding 100). A zone dies when price closes above its top (gap
+// fully reclaimed); its order is cancelled.
+// Stop is frozen at zone creation (above the top, min ATR distance);
+// take profit is a quick fixed R scalp (default 1R).
+strategy("FVG Shorts HF", overlay = true, initial_capital = 10000, pyramiding = 100, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
+
+minGap = input.float(0.0, "Min gap size (x ATR, 0 = any)", minval = 0, step = 0.05)
+stopBufTicks = input.int(3, "Stop buffer above zone (ticks)", minval = 0)
+minStopAtr = input.float(0.2, "Min stop distance (x ATR)", step = 0.05)
+riskPct = input.float(0.5, "Risk per trade (% equity)", step = 0.1)
+rr = input.float(1.0, "Take profit (R multiple)", step = 0.25)
+
+atr = ta.atr(14)
+
+var array<float> zTop = array.new_float()
+var array<float> zBot = array.new_float()
+var array<float> zStop = array.new_float()
+var array<int> zId = array.new_int()
+var int n = 0
+
+//  Every bearish FVG becomes a zone (added first so it gets its resting
+//  order this very bar, catching immediate retraces).
+if high < low[2] and low[2] - high >= minGap * atr
+    n += 1
+    array.unshift(zTop, low[2])
+    array.unshift(zBot, high)
+    array.unshift(zStop, math.max(low[2] + stopBufTicks * syminfo.mintick, high + minStopAtr * atr))
+    array.unshift(zId, n)
+    box.new(bar_index - 2, low[2], bar_index + 30, high, bgcolor = color.new(color.maroon, 85), border_color = color.new(color.maroon, 50))
+    if array.size(zTop) > 20
+        strategy.cancel("Z" + str.tostring(array.get(zId, array.size(zId) - 1)))
+        array.pop(zTop)
+        array.pop(zBot)
+        array.pop(zStop)
+        array.pop(zId)
+
+//  Manage zones: dead zones cancel their order; live zones keep a resting
+//  sell limit at the bottom edge whenever the close is at/below it.
+if array.size(zTop) > 0
+    for i = array.size(zTop) - 1 to 0
+        b = array.get(zBot, i)
+        id = "Z" + str.tostring(array.get(zId, i))
+        if close > array.get(zTop, i)
+            strategy.cancel(id)
+            array.remove(zTop, i)
+            array.remove(zBot, i)
+            array.remove(zStop, i)
+            array.remove(zId, i)
+        else if close <= b
+            stopPx = array.get(zStop, i)
+            dist = stopPx - b
+            qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+            if qty > 0
+                strategy.entry(id, strategy.short, qty = qty, limit = b)
+                strategy.exit("x" + id, id, stop = stopPx, limit = b - rr * dist)
