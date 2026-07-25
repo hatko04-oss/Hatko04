@@ -2,11 +2,12 @@
 // FVG Longs HF - high-frequency version of the every-touch bot.
 // (True microsecond HFT is impossible on TradingView - this is maximum-
 // turnover intrabar scalping, the fastest Pine can execute.)
-// Every bullish FVG zone keeps a resting BUY LIMIT at its top edge, so a
-// touch fills INTRABAR at the touch price - no waiting for bar close. The
-// order re-arms whenever price is back above the zone, so every touch
-// trades, even while earlier fills are still open (pyramiding 100). A
-// zone dies when price closes below its bottom; its order is cancelled.
+// Every bullish FVG zone keeps a resting BUY LIMIT at its top edge from
+// the moment the zone is created, so a touch fills INTRABAR at the touch
+// price. The order re-arms whenever the bar closes back above the zone
+// top (a wick into the zone that closes above still re-arms), so every
+// touch trades, even while earlier fills are still open (pyramiding 100).
+// A zone dies when price closes below its bottom; its order is cancelled.
 // Stop is frozen at zone creation (below the bottom, min ATR distance);
 // take profit is a quick fixed R scalp (default 1R).
 strategy("FVG Longs HF", overlay = true, initial_capital = 10000, pyramiding = 100, slippage = 10, calc_on_every_tick = false, process_orders_on_close = true, max_boxes_count = 100)
@@ -25,27 +26,8 @@ var array<float> zStop = array.new_float()
 var array<int> zId = array.new_int()
 var int n = 0
 
-//  Manage zones: dead zones cancel their order; live zones keep a resting
-//  buy limit at the top edge whenever price is above the zone.
-if array.size(zTop) > 0
-    for i = array.size(zTop) - 1 to 0
-        t = array.get(zTop, i)
-        id = "Z" + str.tostring(array.get(zId, i))
-        if close < array.get(zBot, i)
-            strategy.cancel(id)
-            array.remove(zTop, i)
-            array.remove(zBot, i)
-            array.remove(zStop, i)
-            array.remove(zId, i)
-        else if low > t
-            stopPx = array.get(zStop, i)
-            dist = t - stopPx
-            qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
-            if qty > 0
-                strategy.entry(id, strategy.long, qty = qty, limit = t)
-                strategy.exit("x" + id, id, stop = stopPx, limit = t + rr * dist)
-
-//  Every bullish FVG becomes a zone with its own resting order slot.
+//  Every bullish FVG becomes a zone (added first so it gets its resting
+//  order this very bar, catching immediate retraces).
 if low > high[2] and low - high[2] >= minGap * atr
     n += 1
     array.unshift(zTop, low)
@@ -59,3 +41,23 @@ if low > high[2] and low - high[2] >= minGap * atr
         array.pop(zBot)
         array.pop(zStop)
         array.pop(zId)
+
+//  Manage zones: dead zones cancel their order; live zones keep a resting
+//  buy limit at the top edge whenever the close is at/above the zone top.
+if array.size(zTop) > 0
+    for i = array.size(zTop) - 1 to 0
+        t = array.get(zTop, i)
+        id = "Z" + str.tostring(array.get(zId, i))
+        if close < array.get(zBot, i)
+            strategy.cancel(id)
+            array.remove(zTop, i)
+            array.remove(zBot, i)
+            array.remove(zStop, i)
+            array.remove(zId, i)
+        else if close >= t
+            stopPx = array.get(zStop, i)
+            dist = t - stopPx
+            qty = strategy.equity * riskPct / 100 / (math.max(dist, syminfo.mintick) * syminfo.pointvalue)
+            if qty > 0
+                strategy.entry(id, strategy.long, qty = qty, limit = t)
+                strategy.exit("x" + id, id, stop = stopPx, limit = t + rr * dist)
